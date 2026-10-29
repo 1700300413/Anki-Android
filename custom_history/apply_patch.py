@@ -200,15 +200,424 @@ def patch_text(source):
     return updated
 
 
-def main():
-    if not SOURCE.is_file():
-        raise RuntimeError("Run this from the Anki-Android repository root.")
-    original = SOURCE.read_text(encoding="utf-8")
-    updated = patch_text(original)
-    SOURCE.write_text(updated, encoding="utf-8")
-    print("Updated Reviewer.kt: V6 reveal hook + clipboard retry + grading history.")
-    install_launcher_icons()
-    print("Installed personal launcher icons.")
 
-if __name__ == "__main__":
+# =============================================================================
+# Personal new-reviewer patch (V7): UI, clipboard, grade history
+# =============================================================================
+FRAGMENT = Path('AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/reviewer/ReviewerFragment.kt')
+VIEWMODEL = Path('AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/reviewer/ReviewerViewModel.kt')
+LAYOUT = Path('AnkiDroid/src/main/res/layout/fragment_reviewer.xml')
+NEW_MARK = '// PERSONAL_HISTORY_NEW_REVIEWER_V7'
+NEW_LAYOUT_MARK = '<!-- PERSONAL_HISTORY_NEW_REVIEWER_V7 -->'
+
+
+def _change_once(text, old, new, label):
+    count=text.count(old)
+    if count != 1:
+        lines=text.splitlines()
+        interesting=[i for i,line in enumerate(lines) if any(
+            token in line for token in ('setupAnswerButtons','answerCardInternal',
+                                        'showAnswerInternal','answer_area','tools_layout'))]
+        context='\n'.join(f'{i+1}: {lines[i][:180]}' for i in interesting[:22])
+        raise RuntimeError(f'New-reviewer anchor {label!r}: expected 1, found {count}.\n'
+                           f'Check the fork source version.\nRelevant lines:\n{context}')
+    return text.replace(old,new,1)
+
+
+FRAGMENT_COPY_METHODS = r'''
+    // PERSONAL_HISTORY_NEW_REVIEWER_V7
+    // Read thinking before the new reviewer replaces the question HTML.
+    // Read reflection just before the ViewModel performs the native rating.
+    private var personalHistoryCopyJob: Job? = null
+
+    private fun setupPersonalHistoryBridge() {
+        viewModel.personalHistoryFrontRequests.collectIn(viewLifecycleOwner.lifecycleScope) { reply ->
+            webViewLayout.evaluateJavascript(
+                """
+                (function () {
+                    try {
+                        if (document.getElementById("anki-back-side-flag")) return null;
+                        var field = document.getElementById("my_answer");
+                        return field ? field.value : null;
+                    } catch (e) { return null; }
+                })();
+                """.trimIndent(),
+            ) { raw -> if (!reply.isCompleted) reply.complete(raw) }
+        }
+        viewModel.personalHistoryReflectionRequests.collectIn(viewLifecycleOwner.lifecycleScope) { reply ->
+            webViewLayout.evaluateJavascript(
+                """
+                (function () {
+                    try {
+                        if (!document.getElementById("anki-back-side-flag")) return null;
+                        var field = document.getElementById("my_reflection");
+                        return field ? field.value : "";
+                    } catch (e) { return null; }
+                })();
+                """.trimIndent(),
+            ) { raw -> if (!reply.isCompleted) reply.complete(raw) }
+        }
+    }
+
+    private suspend fun personalHistoryEvaluate(script: String): String? =
+        kotlinx.coroutines.withTimeoutOrNull(1200L) {
+            kotlinx.coroutines.suspendCancellableCoroutine<String?> { continuation ->
+                webViewLayout.evaluateJavascript(script) { raw ->
+                    if (continuation.isActive) continuation.resume(raw)
+                }
+            }
+        }
+
+    private fun personalHistoryStartCopyOnAnswer() {
+        personalHistoryCopyJob?.cancel()
+        personalHistoryCopyJob =
+            viewLifecycleOwner.lifecycleScope.launch {
+                val cardId = viewModel.getCardId()
+                val attempt = viewModel.personalHistoryCopyCandidate(cardId) ?: return@launch
+                repeat(25) {
+                    if (!viewModel.showingAnswer.value || viewModel.getCardId() != cardId) {
+                        return@launch
+                    }
+                    // The new reviewer emits showingAnswer before _showAnswer() runs.
+                    // Wait for the actual answer-side DOM, not merely a page load.
+                    val raw = personalHistoryEvaluate(
+                        """
+                        (function () {
+                            try {
+                                if (!document.getElementById("anki-back-side-flag")) return null;
+                                var template = document.getElementById("analysis-original");
+                                if (!template || !template.content) return null;
+                                var node = document.createElement("div");
+                                node.appendChild(template.content.cloneNode(true));
+                                node.querySelectorAll("img").forEach(function(img) { img.remove(); });
+                                return node.innerHTML.trim();
+                            } catch (e) { return null; }
+                        })();
+                        """.trimIndent(),
+                    )
+                    val analysis = try {
+                        org.json.JSONTokener(raw ?: "null").nextValue() as? String
+                    } catch (e: Exception) {
+                        null
+                    }
+                    if (analysis != null && analysis.length <= 300_000) {
+                        val text = "【题目信息及解析】\n\n" + analysis +
+                            "\n\n【我的思路】\n\n" + attempt.thinking.trim()
+                        try {
+                            val clipboard = requireContext().getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                                as? android.content.ClipboardManager
+                            if (clipboard == null) {
+                                Timber.w("Personal new reviewer: clipboard unavailable")
+                                return@launch
+                            }
+                            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Anki AI", text))
+                        } catch (error: Exception) {
+                            Timber.e(error, "Personal new reviewer: clipboard write failed")
+                            return@launch
+                        }
+                        if (!viewModel.personalHistoryMarkCopied(cardId, attempt.entryId)) return@launch
+                        val thinking = org.json.JSONObject.quote(attempt.thinking)
+                        webViewLayout.evaluateJavascript(
+                            """
+                            (function () {
+                                try {
+                                    var field = document.getElementById("my_answer");
+                                    if (field && !field.value) field.value = $thinking;
+                                    var area = document.getElementById("reflection-area");
+                                    if (area) area.hidden = false;
+                                    var state = JSON.parse(
+                                        sessionStorage.getItem("anki_study_history_auto_v1") || "null"
+                                    );
+                                    if (state) {
+                                        state.copied = true;
+                                        state.thinking = $thinking;
+                                        sessionStorage.setItem(
+                                            "anki_study_history_auto_v1", JSON.stringify(state)
+                                        );
+                                    }
+                                    if (typeof window.AnkiStudyHistoryAutoConfirmCopied === "function" &&
+                                        state && state.entryId) {
+                                        window.AnkiStudyHistoryAutoConfirmCopied(state.entryId);
+                                    }
+                                } catch (e) { console.warn(e); }
+                            })();
+                            """.trimIndent(),
+                            null,
+                        )
+                        Timber.d("Personal new reviewer: answer copied")
+                        return@launch
+                    }
+                    delay(160L)
+                }
+                Timber.w("Personal new reviewer: answer HTML unavailable after retries")
+            }
+    }
+
+'''
+
+VIEWMODEL_HELPERS = r'''
+    // PERSONAL_HISTORY_NEW_REVIEWER_V7
+    data class PersonalHistoryAttempt(
+        val cardId: Long,
+        val entryId: String,
+        val thinking: String,
+        var copied: Boolean = false,
+    )
+
+    val personalHistoryFrontRequests = MutableSharedFlow<CompletableDeferred<String?>>()
+    val personalHistoryReflectionRequests = MutableSharedFlow<CompletableDeferred<String?>>()
+    private var personalHistoryAttempt: PersonalHistoryAttempt? = null
+    private val personalHistorySavedIds = LinkedHashSet<String>()
+
+    fun personalHistoryCopyCandidate(cardId: Long): PersonalHistoryAttempt? =
+        personalHistoryAttempt?.takeIf { it.cardId == cardId && !it.copied && it.thinking.isNotBlank() }
+
+    fun personalHistoryMarkCopied(cardId: Long, entryId: String): Boolean {
+        val attempt = personalHistoryAttempt ?: return false
+        if (attempt.cardId != cardId || attempt.entryId != entryId || attempt.copied) return false
+        attempt.copied = true
+        return true
+    }
+
+    private fun personalHistoryDecodeJsString(raw: String?): String? =
+        try {
+            org.json.JSONTokener(raw ?: "null").nextValue() as? String
+        } catch (error: Exception) {
+            Timber.w(error, "Personal reviewer: invalid WebView data")
+            null
+        }
+
+    private suspend fun personalHistoryCaptureBeforeFlip() {
+        val cardId = currentCard.await().id
+        val deferred = CompletableDeferred<String?>()
+        val raw = withTimeoutOrNull(1400L) {
+            personalHistoryFrontRequests.emit(deferred)
+            deferred.await()
+        }
+        val thinking = personalHistoryDecodeJsString(raw)
+        personalHistoryAttempt =
+            if (thinking != null && thinking.isNotBlank() && thinking.length <= 100_000) {
+                PersonalHistoryAttempt(cardId, java.util.UUID.randomUUID().toString(), thinking)
+            } else {
+                null
+            }
+    }
+
+    private suspend fun personalHistoryGetReflection(): String {
+        val deferred = CompletableDeferred<String?>()
+        val raw = withTimeoutOrNull(1400L) {
+            personalHistoryReflectionRequests.emit(deferred)
+            deferred.await()
+        }
+        val reflection = personalHistoryDecodeJsString(raw)
+        if (reflection == null || reflection.length > 100_000) {
+            Timber.w("Personal reviewer: reflection unavailable, saving thought only")
+            return ""
+        }
+        return reflection
+    }
+
+    private fun personalHistoryEscape(value: String): String =
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\"", "&quot;").replace("'", "&#x27;")
+            .replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
+    private fun personalHistoryAppend(
+        original: String,
+        thought: String,
+        reflection: String,
+        rating: Rating,
+    ): String {
+        val nextRegex = Regex("""【第\s*(\d+)\s*次】""")
+        val legacyRegex = Regex("""【作答记录\s*#\s*(\d+)】""")
+        val next = (nextRegex.findAll(original).mapNotNull { it.groupValues[1].toIntOrNull() } +
+            legacyRegex.findAll(original).mapNotNull { it.groupValues[1].toIntOrNull() })
+            .maxOrNull()?.plus(1) ?: 1
+        val label = when (rating) {
+            Rating.AGAIN -> "Again"
+            Rating.HARD -> "Hard"
+            Rating.GOOD -> "Good"
+            Rating.EASY -> "Easy"
+            else -> "Unknown"
+        }
+        val record = "<b>【第${next}次】</b><br>评分：$label<br>思路：" +
+            personalHistoryEscape(thought) +
+            if (reflection.isNotBlank()) "<br>复盘：" + personalHistoryEscape(reflection) else ""
+        return if (original.isBlank()) record else "$original<hr>$record"
+    }
+
+'''
+
+def patch_new_fragment(source):
+    if NEW_MARK in source:
+        return source
+    source=_change_once(source,
+        'import android.content.Context\n',
+        'import android.content.Context\nimport kotlin.coroutines.resume\n',
+        'fragment-import')
+    source=_change_once(source,
+        '    private fun setupAnswerButtons() {',
+        FRAGMENT_COPY_METHODS+'    private fun setupAnswerButtons() {',
+        'fragment-insert-methods')
+    source=_change_once(source,
+        '        setupTypeAnswer()\n        setupAnswerButtons()',
+        '        setupTypeAnswer()\n        setupPersonalHistoryBridge()\n        setupAnswerButtons()',
+        'fragment-initialize-bridge')
+    source=_change_once(source,
+        '''        if (!Prefs.showAnswerButtons) {
+            binding.answerArea.isVisible = false
+            return
+        }''',
+        '''        binding.personalShowAnswerButton.setOnClickListener { viewModel.onShowAnswer() }
+        if (!Prefs.showAnswerButtons) {
+            binding.personalShowAnswerButton.isVisible = false
+            binding.answerArea.isVisible = false
+            return
+        }''',
+        'fragment-respect-show-buttons')
+    source=_change_once(source,
+        '''            binding.answerArea.setAnswerState(isAnswerShown)
+        }''',
+        '''            binding.answerArea.setAnswerState(isAnswerShown)
+            binding.personalShowAnswerButton.isVisible = !isAnswerShown
+            binding.answerArea.isVisible = isAnswerShown
+            if (isAnswerShown) {
+                personalHistoryStartCopyOnAnswer()
+            } else {
+                personalHistoryCopyJob?.cancel()
+            }
+        }''',
+        'fragment-top-show-answer-flow')
+    return source
+
+def patch_new_viewmodel(source):
+    if NEW_MARK in source:
+        return source
+    source=_change_once(source,
+        '    private var isInputFocused = false\n',
+        '    private var isInputFocused = false\n'+VIEWMODEL_HELPERS,
+        'viewmodel-methods')
+    source=_change_once(source,
+        '''        updateNextTimes()
+        showAnswer()
+        loadAndPlayMedia(CardSide.ANSWER)''',
+        '''        updateNextTimes()
+        personalHistoryCaptureBeforeFlip()
+        showAnswer()
+        loadAndPlayMedia(CardSide.ANSWER)''',
+        'viewmodel-capture-before-flip')
+    source=_change_once(source,
+        '''        val state = queueState.await() ?: return
+        val card = currentCard.await()
+        val answer =
+            withCol {
+                sched.answerCard(''',
+        '''        val state = queueState.await() ?: return
+        val card = currentCard.await()
+        val historyAttempt = personalHistoryAttempt?.takeIf {
+            it.cardId == card.id && it.copied && it.thinking.isNotBlank() &&
+                it.entryId !in personalHistorySavedIds
+        }
+        val historyReflection = if (historyAttempt != null) personalHistoryGetReflection() else ""
+        val answer =
+            withCol {
+                sched.answerCard(''',
+        'viewmodel-grade-snapshot')
+    source=_change_once(source,
+        '        undoableOp(handler = this) { sched.answerCard(answer) }\n',
+        '''        // Keep note history and native grading in one undoable transaction.
+        var historyWasSaved = false
+        undoableOp(handler = this) {
+            if (historyAttempt != null) {
+                val note = getNote(card.nid)
+                if ("答题历史" in note) {
+                    note.setItem(
+                        "答题历史",
+                        personalHistoryAppend(
+                            note.getItem("答题历史"),
+                            historyAttempt.thinking,
+                            historyReflection,
+                            rating,
+                        ),
+                    )
+                    updateNote(note)
+                    historyWasSaved = true
+                }
+            }
+            sched.answerCard(answer)
+        }
+        if (historyWasSaved && historyAttempt != null) {
+            personalHistorySavedIds.add(historyAttempt.entryId)
+            if (personalHistorySavedIds.size > 128) {
+                personalHistorySavedIds.remove(personalHistorySavedIds.first())
+            }
+        }
+        personalHistoryAttempt = null
+''',
+        'viewmodel-grade-atomic-note')
+    return source
+
+PERSONAL_TOP_BUTTON = '''        <!-- PERSONAL_HISTORY_NEW_REVIEWER_V7 -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/personal_show_answer_button"
+            style="@style/AnswerButton"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:layout_marginHorizontal="@dimen/reviewer_side_margin"
+            android:layout_marginVertical="4dp"
+            android:text="@string/show_answer"
+            android:textColor="@color/white"
+            android:backgroundTint="?showAnswerButtonBackground"
+            app:cornerRadius="12dp" />
+
+'''
+
+def patch_new_layout(source):
+    if NEW_LAYOUT_MARK in source:
+        return source
+    return _change_once(source,
+        '''        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/web_view_container"''',
+        PERSONAL_TOP_BUTTON+
+        '''        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/web_view_container"''',
+        'layout-top-button')
+
+
+def patch_new_reviewer_files():
+    targets=(FRAGMENT,VIEWMODEL,LAYOUT)
+    missing=[str(path) for path in targets if not path.is_file()]
+    if missing:
+        raise RuntimeError('Missing new study screen files: '+', '.join(missing))
+    contents=[path.read_text(encoding='utf-8') for path in targets]
+    outputs=(patch_new_fragment(contents[0]),
+             patch_new_viewmodel(contents[1]),
+             patch_new_layout(contents[2]))
+    # Verify all upstream anchors before writing anything to disk.
+    for path,changed in zip(targets,outputs):
+        path.write_text(changed,encoding='utf-8')
+    print('Patched new study screen: top Show Answer, clipboard, rating history.')
+
+
+def main():
+    # The new-screen files must be present. Fail closed if their version is new.
+    for file in (FRAGMENT, VIEWMODEL, LAYOUT):
+        if not file.is_file():
+            raise RuntimeError(f'Missing new study screen source: {file}')
+    # Apply new screen first; source matching is validated before any write.
+    patch_new_reviewer_files()
+    # Keep older study screen functionality when the fork matches one of the
+    # known legacy variants. A mismatch here must not block the new reviewer.
+    if SOURCE.is_file():
+        old_source=SOURCE.read_text(encoding='utf-8')
+        try:
+            old_result=patch_text(old_source)
+            SOURCE.write_text(old_result,encoding='utf-8')
+            print('Legacy reviewer patch retained.')
+        except RuntimeError as error:
+            print('WARNING: old study screen patch not installed: '+str(error)[:800])
+    install_launcher_icons()
+    print('Installed personal launcher icons; new study screen patch ready.')
+
+if __name__ == '__main__':
     main()
