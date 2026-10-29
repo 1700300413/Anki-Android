@@ -202,13 +202,13 @@ def patch_text(source):
 
 
 # =============================================================================
-# Personal new-reviewer patch (V7): UI, clipboard, grade history
+# Personal new-reviewer patch (V8): unified top controls, clipboard, grade history
 # =============================================================================
 FRAGMENT = Path('AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/reviewer/ReviewerFragment.kt')
 VIEWMODEL = Path('AnkiDroid/src/main/java/com/ichi2/anki/ui/windows/reviewer/ReviewerViewModel.kt')
 LAYOUT = Path('AnkiDroid/src/main/res/layout/fragment_reviewer.xml')
-NEW_MARK = '// PERSONAL_HISTORY_NEW_REVIEWER_V7'
-NEW_LAYOUT_MARK = '<!-- PERSONAL_HISTORY_NEW_REVIEWER_V7 -->'
+NEW_MARK = '// PERSONAL_HISTORY_NEW_REVIEWER_V8'
+NEW_LAYOUT_MARK = '<!-- PERSONAL_HISTORY_NEW_REVIEWER_V8 -->'
 
 
 def _change_once(text, old, new, label):
@@ -225,7 +225,7 @@ def _change_once(text, old, new, label):
 
 
 FRAGMENT_COPY_METHODS = r'''
-    // PERSONAL_HISTORY_NEW_REVIEWER_V7
+    // PERSONAL_HISTORY_NEW_REVIEWER_V8
     // Read thinking before the new reviewer replaces the question HTML.
     // Read reflection just before the ViewModel performs the native rating.
     private var personalHistoryCopyJob: Job? = null
@@ -356,7 +356,7 @@ FRAGMENT_COPY_METHODS = r'''
 '''
 
 VIEWMODEL_HELPERS = r'''
-    // PERSONAL_HISTORY_NEW_REVIEWER_V7
+    // PERSONAL_HISTORY_NEW_REVIEWER_V8
     data class PersonalHistoryAttempt(
         val cardId: Long,
         val entryId: String,
@@ -464,23 +464,11 @@ def patch_new_fragment(source):
         '        setupTypeAnswer()\n        setupPersonalHistoryBridge()\n        setupAnswerButtons()',
         'fragment-initialize-bridge')
     source=_change_once(source,
-        '''        if (!Prefs.showAnswerButtons) {
-            binding.answerArea.isVisible = false
-            return
-        }''',
-        '''        binding.personalShowAnswerButton.setOnClickListener { viewModel.onShowAnswer() }
-        if (!Prefs.showAnswerButtons) {
-            binding.personalShowAnswerButton.isVisible = false
-            binding.answerArea.isVisible = false
-            return
-        }''',
-        'fragment-respect-show-buttons')
-    source=_change_once(source,
         '''            binding.answerArea.setAnswerState(isAnswerShown)
         }''',
         '''            binding.answerArea.setAnswerState(isAnswerShown)
-            binding.personalShowAnswerButton.isVisible = !isAnswerShown
-            binding.answerArea.isVisible = isAnswerShown
+            // The same AnswerAreaView is now directly below the toolbar.
+            // It owns both Show Answer and all four native rating buttons.
             if (isAnswerShown) {
                 personalHistoryStartCopyOnAnswer()
             } else {
@@ -488,6 +476,12 @@ def patch_new_fragment(source):
             }
         }''',
         'fragment-top-show-answer-flow')
+    source = _change_once(
+        source,
+        'binding.bottomLayout.removeView(binding.answerArea)',
+        '(binding.answerArea.parent as? android.view.ViewGroup)?.removeView(binding.answerArea)',
+        'fragment-toolbar-bottom-tablet-reparent',
+    )
     return source
 
 def patch_new_viewmodel(source):
@@ -557,31 +551,60 @@ def patch_new_viewmodel(source):
         'viewmodel-grade-atomic-note')
     return source
 
-PERSONAL_TOP_BUTTON = '''        <!-- PERSONAL_HISTORY_NEW_REVIEWER_V7 -->
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/personal_show_answer_button"
-            style="@style/AnswerButton"
+# Existing AnkiDroid AnswerAreaView contains both "Show Answer" and the
+# original Again / Hard / Good / Easy rating buttons, plus their next times.
+# It must exist exactly once and must remain connected to the original click
+# listeners in setupAnswerButtons().
+ANSWER_AREA_BOTTOM_XML = """            <com.ichi2.anki.ui.windows.reviewer.AnswerAreaView
+                android:id="@+id/answer_area"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"/>"""
+
+ANSWER_AREA_TOP_XML = """        <!-- PERSONAL_HISTORY_NEW_REVIEWER_V8 -->
+        <!-- One native control group: question = Show Answer; answer = ratings. -->
+        <com.ichi2.anki.ui.windows.reviewer.AnswerAreaView
+            android:id="@+id/answer_area"
             android:layout_width="match_parent"
-            android:layout_height="52dp"
+            android:layout_height="wrap_content"
+            android:minHeight="?minTouchTargetSize"
             android:layout_marginHorizontal="@dimen/reviewer_side_margin"
             android:layout_marginVertical="4dp"
-            android:text="@string/show_answer"
-            android:textColor="@color/white"
-            android:backgroundTint="?showAnswerButtonBackground"
-            app:cornerRadius="12dp" />
+            android:clipChildren="false"
+            android:elevation="1dp" />
 
-'''
+"""
+
 
 def patch_new_layout(source):
     if NEW_LAYOUT_MARK in source:
         return source
-    return _change_once(source,
-        '''        <com.google.android.material.card.MaterialCardView
-            android:id="@+id/web_view_container"''',
-        PERSONAL_TOP_BUTTON+
-        '''        <com.google.android.material.card.MaterialCardView
-            android:id="@+id/web_view_container"''',
-        'layout-top-button')
+    if 'personal_show_answer_button' in source:
+        raise RuntimeError(
+            "Reviewer layout already contains the older V7 standalone top button. "
+            "Apply V8 to a clean upstream checkout, rather than editing a "
+            "previously patched XML file."
+        )
+
+    # First check ALL anchors before modifying any text.
+    old_area = _change_once(
+        source, ANSWER_AREA_BOTTOM_XML, "", "layout-original-answer-area"
+    )
+    # Precede the original card container; tools_layout stays above this
+    # component when toolbar position is TOP.
+    updated = _change_once(
+        old_area,
+        """        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/web_view_container" """.rstrip(),
+        ANSWER_AREA_TOP_XML +
+        """        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/web_view_container" """.rstrip(),
+        "layout-move-complete-answer-area-top",
+    )
+    if updated.count('android:id="@+id/answer_area"') != 1:
+        raise RuntimeError("Expected exactly one native answer area after relocation")
+    if updated.count('android:id="@+id/personal_show_answer_button"') != 0:
+        raise RuntimeError("Unexpected duplicate V7 standalone Show Answer button")
+    return updated
 
 
 def patch_new_reviewer_files():
@@ -596,7 +619,7 @@ def patch_new_reviewer_files():
     # Verify all upstream anchors before writing anything to disk.
     for path,changed in zip(targets,outputs):
         path.write_text(changed,encoding='utf-8')
-    print('Patched new study screen: top Show Answer, clipboard, rating history.')
+    print('Patched V8 new study screen: Show Answer + ratings share top position; clipboard + history retained.')
 
 
 def main():
